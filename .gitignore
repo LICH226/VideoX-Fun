@@ -1,5 +1,5 @@
 # Byte-compiled / optimized / DLL files
-models*
+# models*
 output*
 logs*
 taming*
@@ -20,7 +20,7 @@ scripts_demo*
 .Python
 build/
 develop-eggs/
-dist/
+# dist/
 downloads/
 eggs/
 .eggs/
