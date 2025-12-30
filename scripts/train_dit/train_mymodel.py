@@ -42,6 +42,8 @@ from videox_fun.pipeline import WanFunInpaintPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import save_videos_grid
 from videox_fun.utils.lora_utils import create_network
+from peft import LoraConfig, get_peft_model, PeftModel
+
 
 if is_wandb_available():
     import wandb
@@ -219,11 +221,11 @@ def main():
         additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
     ).eval()
     
-    # 3. CLIP Image Encoder (For Cloth condition)
-    logger.info("load clip_encoder!")
-    clip_image_encoder = CLIPModel.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
-    ).eval()
+    # # 3. CLIP Image Encoder (For Cloth condition)
+    # logger.info("load clip_encoder!")
+    # clip_image_encoder = CLIPModel.from_pretrained(
+    #     os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    # ).eval()
 
     # 4. Transformer (Trainable)
     logger.info("load dit!")
@@ -231,7 +233,7 @@ def main():
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
         torch_dtype=weight_dtype,
-        low_cpu_mem_usage=True    
+        low_cpu_mem_usage=False    
     )
 
     logger.info(f"=> loading siglip_image_encoder: {args.image_encoder_path}")
@@ -249,7 +251,7 @@ def main():
     # Freeze Frozen Models
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    clip_image_encoder.requires_grad_(False)
+    # clip_image_encoder.requires_grad_(False)
     siglip_image_encoder.requires_grad_(False)
     dino_image_encoder.requires_grad_(False)
 
@@ -266,17 +268,27 @@ def main():
     transformer3d.requires_grad_(False)
 
 
-    trainable_keywords = [
-        "patch_embedding", 
-        "subject_image_proj_model", 
-        "k_ip", 
-        "v_ip", 
-        "norm_k_ip"
-    ]
+    lora_config = LoraConfig(
+        r=args.rank, 
+        lora_alpha=args.network_alpha,
+        init_lora_weights="gaussian",
+        target_modules=[
+            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o"
+        ],
+        modules_to_save=[
+            "patch_embedding", 
+            "subject_image_proj_model", 
+            "k_ip",    # 你的新模块
+            "v_ip",    # 你的新模块
+            "norm_k_ip",
+            "adapter", # 如果有
+            "cloth_patch_embedding"
+        ]
+    )
 
-    for name, param in transformer3d.named_parameters():
-        if any(keyword in name for keyword in trainable_keywords):
-            param.requires_grad = True
+    transformer3d = get_peft_model(transformer3d, lora_config)
+    transformer3d.print_trainable_parameters()
 
     transformer3d.to(weight_dtype)
 
@@ -316,22 +328,48 @@ def main():
     )
 
     def vton_collate_fn(examples):
-        # 1. 随机分辨率 (256-512, 步长32)
-        target_res = random.choice(range(256, 512 + 1, 32))
+        # 1. 获取当前 Batch 的基准长宽比
+        # 因为 Sampler 已经分好桶了，我们取第一个样本的形状作为参考即可
+        ref_tensor = examples[0]["pixel_values"] # [C, T, H, W] or [C, H, W]
+        orig_h = ref_tensor.shape[-2]
+        orig_w = ref_tensor.shape[-1]
+        batch_aspect_ratio = orig_h / orig_w
+
+        # 2. 随机采样“训练分辨率基准” (Pixel Area Base)
+        # 论文策略：Stage 1 在 256-512 之间采样
+        base_size = random.choice(range(256, 512 + 1, 32)) 
         
-        # 2. 判断 Batch 类型 (全视频 or 全图片)
-        # 取第一个样本看长度，>1 就是视频
+        # 3. 计算目标 H, W
+        # 逻辑：保持 Aspect Ratio，让短边 = base_size (或者长边，取决于策略)
+        if batch_aspect_ratio > 1: # 竖屏 (Tall)
+            target_w = base_size
+            target_h = int(base_size * batch_aspect_ratio)
+        else: # 横屏 (Wide)
+            target_h = base_size
+            target_w = int(base_size / batch_aspect_ratio)
+
+        # 4. 对齐到 16 (VAE 下采样倍率)
+        stride = 32
+        target_h = round(target_h / stride) * stride
+        target_w = round(target_w / stride) * stride
+        
+        # 兜底防止尺寸为0
+        target_h = max(stride, target_h)
+        target_w = max(stride, target_w)
+
+        # 5. 处理 Batch
+        # -----------------------------------------------
+        # 下面的逻辑与之前类似，但 interpolate 的 size 变成了动态的
+        
         first_len = examples[0]["pixel_values"].shape[0]
         is_video = first_len > 1
         
-        # 3. 设定目标长度
         if is_video:
-            # 如果是视频，统一对齐到当前batch最大的帧数 (通常49)，并满足 4k+1
             max_len = max([ex["pixel_values"].shape[0] for ex in examples])
             target_len = (max_len - 1) // 4 * 4 + 1
             target_len = max(1, int(target_len))
         else:
-            target_len = 1 # 图片固定为1
+            target_len = 1 
 
         temporal_keys = ["pixel_values", "densepose_pixel_values", "agnostic_pixel_values", "mask_pixel_values"]
         aligned_examples = []
@@ -344,6 +382,7 @@ def main():
             for key in temporal_keys:
                 tensor = ex[key] 
                 
+                # 时间对齐
                 if curr_len < target_len:
                     repeat_times = target_len // curr_len + 1
                     tensor = tensor.repeat(repeat_times, 1, 1, 1)[:target_len]
@@ -353,23 +392,31 @@ def main():
                 mode = 'nearest' if 'mask' in key or 'densepose' in key else 'bilinear'
                 align_corners = False if mode != 'nearest' else None 
 
+                # [关键]：使用动态计算的 target_h, target_w
                 tensor_resized = F.interpolate(
                     tensor, 
-                    size=(target_res, target_res), 
+                    size=(target_h, target_w), 
                     mode=mode, 
                     align_corners=align_corners,
                     antialias=True if mode != 'nearest' else False
                 )
                 new_ex[key] = tensor_resized
 
+            # Cloth 处理 (Cloth 始终是单帧图片)
+            # Cloth 可以缩放到同样的 target_h/w，或者保持正方形 512x512
+            # 这里的策略取决于模型：Wan2.1 的 Clip/Image Encoder 是否要求 Cloth 必须是方形？
+            # 假设 Wan2.1 的 Image Encoder (SigLIP/DINO) 内部会自己处理 Resize (通常是Resize到224或384的正方形)
+            # 所以这里 Cloth 我们可以简单 Resize 到 target_h/target_w 方便处理，或者固定 512
+            # 为了保险起见，让 Cloth 和 Main Video 尺寸一致是比较通用的做法
             new_ex["cloth_pixel_values"] = F.interpolate(
-                ex["cloth_pixel_values"], size=(target_res, target_res), 
+                ex["cloth_pixel_values"], 
+                size=(target_h, target_w), 
                 mode='bilinear', align_corners=False, antialias=True
             )
+            
             new_ex["text"] = ex["text"]
             aligned_examples.append(new_ex)
 
-        # Stack
         batch = {
             "pixel_values": torch.stack([ex["pixel_values"] for ex in aligned_examples]),
             "cloth_pixel_values": torch.stack([ex["cloth_pixel_values"] for ex in aligned_examples]),
@@ -380,7 +427,6 @@ def main():
             "data_type": [ex["data_type"] for ex in aligned_examples]
         }
         
-        # Tokenizer
         prompt_ids = tokenizer(
             batch["text"], max_length=512, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -432,7 +478,7 @@ def main():
 
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
+    # clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
     dino_image_encoder.to(accelerator.device, dtype=weight_dtype)
     siglip_image_encoder.to(accelerator.device, dtype=weight_dtype)
 
@@ -443,6 +489,7 @@ def main():
 
     initial_global_step = 0
     first_epoch = 0
+    global_step = 0
 
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -509,6 +556,7 @@ def main():
                     latents = encode_vae(pixel_values) 
                     mask_latents = encode_vae(agnostic_values)
                     densepose_latents = encode_vae(densepose_values) 
+                    cloth_latents = encode_vae(cloth_values)
 
                     def prepare_vton_mask(mask, latents):
                         mask_padded = torch.cat(
@@ -565,7 +613,6 @@ def main():
                                 images=images,
                                 return_tensors="pt",
                                 do_resize=False,       # 我们自己做 interpolate
-                                do_center_crop=False,  # 我们自己做 crop
                                 do_rescale=False,      # 输入已经是 [0, 1] float，不需要 /255
                                 do_normalize=True      # 执行标准化
                             ).pixel_values.to(device, dtype)
@@ -623,7 +670,7 @@ def main():
                     mask_values = prepare_vton_mask(mask_values, latents)
                     inpaint_latents = torch.cat([mask_values, mask_latents, densepose_latents], dim=1) 
                     
-                    clip_context = clip_image_encoder(cloth_values)
+                    # clip_context = clip_image_encoder(cloth_values)
 
                     cloth_img_frame0 = cloth_values[:, :, 0, :, :] 
                     subject_image_embeds_dict = encode_image_emb(
@@ -631,6 +678,7 @@ def main():
                         accelerator.device, 
                         weight_dtype
                     )
+
 
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -647,9 +695,9 @@ def main():
                 
                 noisy_latents = noisy_latents.to(weight_dtype)
                 encoder_hidden_states = encoder_hidden_states.to(weight_dtype)
-                clip_context = clip_context.to(weight_dtype)
+                # clip_context = clip_context.to(weight_dtype)
                 inpaint_latents = inpaint_latents.to(weight_dtype)
-
+                cloth_latents = cloth_latents.to(weight_dtype)
 
                 with accelerator.autocast():
                     noise_pred = transformer3d(
@@ -658,7 +706,8 @@ def main():
                         context=encoder_hidden_states,
                         t=timesteps,
                         y=inpaint_latents,   
-                        clip_fea=clip_context,
+                        # clip_fea=clip_context,
+                        cloth_latents=cloth_latents,
                         subject_image_embeds_dict=subject_image_embeds_dict,
                     )
 
@@ -696,8 +745,12 @@ def main():
                 # Checkpointing
                 if global_step % args.checkpointing_steps == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    os.makedirs(save_path, exist_ok=True)
+                    unwrapped_model = accelerator.unwrap_model(transformer3d)
+                    unwrapped_model.save_pretrained(save_path)
+                    logger.info(f"Saved PEFT inference weights to {save_path}")
                     accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
+                    logger.info(f"Saved full training state (optimizer/scheduler) to {save_path}")
 
             if global_step >= args.max_train_steps:
                 break

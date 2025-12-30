@@ -2,7 +2,7 @@
 
 # 1. 设置路径
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export MODEL_NAME="/data/code/models/alibaba-pai/Wan2.1-Fun-14B-InP"
+export MODEL_NAME="/data/code/models/Wan-AI/Wan2.2-TI2V-5B"
 export DATASET_NAME="/data/code/data/mydata/"
 
 # 【关键】指向新生成的带有宽高信息的 jsonl
@@ -10,33 +10,35 @@ export TRAIN_DATASET_META_NAME="/data/code/data/mydata/train_metadata.jsonl"
 export TEST_DATASET_META_NAME="/data/code/data/mydata/test_metadata.jsonl"
 
 # 定义输出目录变量，防止手写出错
-export OUTPUT_DIR="output_wan_49frames_12_23"
+export OUTPUT_DIR="output_wan_2_2_49frames_12_30"
 
 # 2. 预先创建输出目录 (防止 tee 报错)
 mkdir -p $OUTPUT_DIR
 
 # 3. 分布式设置
 export NCCL_DEBUG=WARN
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1  # 如果你不是多机训练，把 InfiniBand 也关了防止干扰
+
 
 # 4. 启动训练
 echo "Starting training... Logs will be saved to $OUTPUT_DIR/training_output.log"
 
 accelerate launch --config_file config/accelerate_config.yaml \
-  scripts/wan2.1_fun/train_mymodel.py \
-  --config_path="config/wan2.1/wan_civitai_mymodel.yaml" \
+  scripts/train_dit/train_mymodel.py \
+  --config_path="config/train_mymodel/train_wan_2-2.yaml" \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir=$DATASET_NAME \
   --train_data_meta=$TRAIN_DATASET_META_NAME \
   --output_dir=$OUTPUT_DIR \
   --seed=42 \
   --train_batch_size=4 \
-  --gradient_accumulation_steps=16 \
+  --gradient_accumulation_steps=4 \
   --dataloader_num_workers=4 \
   --num_train_epochs=1000 \
-  --checkpointing_steps=200 \
-  --max_train_steps=20000 \
+  --checkpointing_steps=500 \
+  --max_train_steps=10000 \
   --learning_rate=1e-5 \
-  --resume_from_checkpoint="checkpoint-200" \
   --lr_scheduler="constant_with_warmup" \
   --lr_warmup_steps=200 \
   --gradient_checkpointing \

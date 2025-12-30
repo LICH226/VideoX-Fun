@@ -11,10 +11,16 @@ import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
 from diffusers.utils import is_torch_version
 
-from .wan_transformer3d import (WanAttentionBlock, WanTransformer3DModel, WanRMSNorm , WanSelfAttention,
+from .wan_transformer3d import (WanAttentionBlock, WanTransformer3DModel, Wan2_2Transformer3DModel, WanRMSNorm , WanSelfAttention,
                                 sinusoidal_embedding_1d)
 from ..utils import cfg_skip
 from .attention_utils import attention
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
 
 class WanTransformer3DTryonModel(WanTransformer3DModel):
     def __init__(self,                  
@@ -36,6 +42,12 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
         super().__init__(model_type,patch_size,text_len,in_dim,dim,ffn_dim,freq_dim,text_dim,out_dim,num_heads,num_layers,window_size,qk_norm,cross_attn_norm,eps)
 
         self.subject_image_proj_model = CrossLayerCrossScaleProjector(output_dim=self.dim, timestep_in_dim=self.freq_dim)
+
+        self.cloth_dim = 48
+        self.cloth_patch_embedding = zero_module(nn.Conv3d(self.cloth_dim, dim, kernel_size=patch_size, stride=patch_size))
+        with torch.no_grad():
+            self.cloth_patch_embedding.weight.copy_(self.patch_embedding.weight.data[:, :self.cloth_dim, :, :, :])
+            self.cloth_patch_embedding.bias.copy_(self.patch_embedding.bias)
 
         cross_attn_type = 'i2v_cross_attn' 
         self.blocks = nn.ModuleList([
@@ -67,13 +79,14 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
         full_ref=None,
         subject_ref=None,
         cond_flag=True,
+        cloth_latents=None,
     ):
         t_adapter = t.to(dtype=x.dtype)
         t_adapter = t_adapter*1000.0
         ip_hidden_states = self.subject_image_proj_model(
-            low_res_shallow=subject_image_embeds_dict['image_embeds_low_res_shallow'],
-            low_res_deep=subject_image_embeds_dict['image_embeds_low_res_deep'],
-            high_res_deep=subject_image_embeds_dict['image_embeds_high_res_deep'],
+            subject_image_embeds_dict['image_embeds_low_res_shallow'],
+            subject_image_embeds_dict['image_embeds_low_res_deep'],
+            subject_image_embeds_dict['image_embeds_high_res_deep'],
             timesteps=t_adapter, 
             need_temb=True
         )[0]
@@ -85,6 +98,11 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        if cloth_latents is not None:
+            # cloth embeddings
+            cloth_latents = self.cloth_patch_embedding(cloth_latents)
+            cloth_latents = cloth_latents.flatten(2).transpose(1, 2) # B L C 
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -130,7 +148,7 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
         ])
 
  # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast(device_type="cuda",dtype=torch.float32):
             if t.dim() != 1:
                 if t.size(1) < seq_len:
                     pad_size = seq_len - t.size(1)
@@ -224,6 +242,7 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
                             context,
                             context_lens,
                             ip_hidden_states,
+                            cloth_latents,
                             t,
                             dtype,
                             **ckpt_kwargs,
@@ -239,6 +258,7 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
                             context_lens=context_lens,
                             dtype=dtype,
                             ip_hidden_states=ip_hidden_states,
+                            cloth_latents=cloth_latents,
                             t=t  
                         )
                         x = block(x, **kwargs)
@@ -267,6 +287,7 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
                         context,
                         context_lens,
                         ip_hidden_states,
+                        cloth_latents,
                         t,
                         dtype,
                         **ckpt_kwargs,
@@ -282,6 +303,7 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
                         context_lens=context_lens,
                         dtype=dtype,
                         ip_hidden_states=ip_hidden_states,
+                        cloth_latents=cloth_latents,
                         t=t  
                     )
                     x = block(x, **kwargs)
@@ -321,6 +343,19 @@ class WanTransformer3DTryonModel(WanTransformer3DModel):
         return x
         
 
+class Adapter(nn.Module):
+    """Lightweight residual adapter"""
+    def __init__(self, dim, adapter_dim=64):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, adapter_dim),
+            nn.ReLU(),
+            nn.Linear(adapter_dim, dim)
+        )
+
+    def forward(self, x):
+        return self.ffn(x)
+
 class WanAttentionBlockTryon(WanAttentionBlock):
     def __init__(self, cross_attn_type, dim, ffn_dim, num_heads, window_size=..., qk_norm=True, cross_attn_norm=False, eps=0.000001):
         super().__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
@@ -342,6 +377,7 @@ class WanAttentionBlockTryon(WanAttentionBlock):
         context,
         context_lens,
         ip_hidden_states,
+        cloth_latents,
         t=0,
         dtype=torch.float32
     ):
@@ -367,8 +403,8 @@ class WanAttentionBlockTryon(WanAttentionBlock):
         # WanSelfAttention 内部计算 q, k, v，应用 RoPE，执行注意力，然后通过输出投影 self.o。
         # 它接收 [B, L, C]，输出的 y shape 仍然是 [B, L, C]
 
-        def cross_attn_ffn(x, context, ip_hidden_states, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, ip_hidden_states, context_lens, t)
+        def cross_attn_ffn(x, context, ip_hidden_states, context_lens, cloth_latents, e):
+            x = x + self.cross_attn(self.norm3(x), context, ip_hidden_states, context_lens, cloth_latents, t)
             temp_x = self.norm2(x) * (1 + e[4]) + e[3]
             temp_x = temp_x.to(dtype)
             
@@ -376,7 +412,7 @@ class WanAttentionBlockTryon(WanAttentionBlock):
             x = x + y * e[5]
             return x
 
-        x = cross_attn_ffn(x, context, ip_hidden_states, context_lens, e)
+        x = cross_attn_ffn(x, context, ip_hidden_states, context_lens,cloth_latents, e)
         return x
 
 class WanT2VCrossAttentionTryon(WanSelfAttention):
@@ -388,42 +424,46 @@ class WanT2VCrossAttentionTryon(WanSelfAttention):
                  eps=1e-6):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
 
-        self.k_img = nn.Linear(dim, dim)
-        self.v_img = nn.Linear(dim, dim)
-        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        # self.k_img = nn.Linear(dim, dim)
+        # self.v_img = nn.Linear(dim, dim)
+        # self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         self.k_ip = nn.Linear(dim, dim)
         self.v_ip = nn.Linear(dim, dim)
         self.norm_k_ip = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context,ip_hidden_states, context_lens, t=0,dtype=torch.bfloat16):
+        self.adapter_cloth = Adapter(dim)
+
+    def forward(self, x, context,ip_hidden_states, context_lens, cloth_latents, t=0,dtype=torch.bfloat16):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        context_img = context[:, :257]
-        context = context[:, 257:]
+        # context_img = context[:, :257]
+        # context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
         q = self.norm_q(self.q(x.to(dtype))).view(b, -1, n, d)
         k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
         v = self.v(context.to(dtype)).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img.to(dtype))).view(b, -1, n, d)
-        v_img = self.v_img(context_img.to(dtype)).view(b, -1, n, d)
+        # k_img = self.norm_k_img(self.k_img(context_img.to(dtype))).view(b, -1, n, d)
+        # v_img = self.v_img(context_img.to(dtype)).view(b, -1, n, d)
         k_ip = self.norm_k_ip(self.k_ip(ip_hidden_states.to(dtype))).view(b, -1, n, d)
         v_ip = self.v_ip(ip_hidden_states.to(dtype)).view(b, -1, n, d)
 
+        k_cloth_vae = self.norm_k(self.k(cloth_latents)).view(b, -1, n, d) + self.norm_k(self.adapter_cloth(cloth_latents)).view(b, -1, n, d)
+        v_cloth_vae = self.v(cloth_latents).view(b, -1, n, d) + self.adapter_cloth(cloth_latents).view(b, -1, n, d)
 
-        img_x = attention(
-            q.to(dtype), 
-            k_img.to(dtype), 
-            v_img.to(dtype), 
-            k_lens=None
-        )
-        img_x = img_x.to(dtype)
+        # img_x = attention(
+        #     q.to(dtype), 
+        #     k_img.to(dtype), 
+        #     v_img.to(dtype), 
+        #     k_lens=None
+        # )
+        # img_x = img_x.to(dtype)
         # compute attention
         x = attention(
             q.to(dtype), 
@@ -431,7 +471,6 @@ class WanT2VCrossAttentionTryon(WanSelfAttention):
             v.to(dtype), 
             k_lens=context_lens
         )
-        x = x.to(dtype)
 
         ip_x = attention(
             q.to(dtype),
@@ -440,11 +479,23 @@ class WanT2VCrossAttentionTryon(WanSelfAttention):
             k_lens=None
         )
 
+        img_x_vae = attention(
+            q, 
+            k_cloth_vae, 
+            v_cloth_vae, 
+            k_lens=None
+        )
         # output
+        x = x.to(dtype)
+        ip_x = ip_x.to(dtype)
+        img_x_vae = img_x_vae.to(dtype)
+
         x = x.flatten(2)
-        img_x = img_x.flatten(2)
+        # img_x = img_x.flatten(2)
         ip_x = ip_x.flatten(2)
-        x = x + img_x + ip_x
+        # x = x + img_x + ip_x
+        img_x_vae = img_x_vae.flatten(2)
+        x = x + ip_x + img_x_vae
         x = self.o(x)
         return x
 
