@@ -43,6 +43,7 @@ from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import save_videos_grid
 from videox_fun.utils.lora_utils import create_network
 from peft import LoraConfig, get_peft_model, PeftModel
+from functools import partial
 
 
 if is_wandb_available():
@@ -52,7 +53,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 # -------------------------------------------------------------------------
 # 2. Utils
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 
 def filter_kwargs(cls, kwargs):
     import inspect
@@ -136,6 +137,8 @@ def main():
     parser.add_argument("--video_repeat", type=int, default=0)
     parser.add_argument("--dataloader_num_workers", type=int, default=0, help="Number of subprocesses to use for data loading")
     parser.add_argument("--video_sample_stride", type=int, default=1, help="Stride for video sampling")
+    parser.add_argument("--max_res", type=int, default=512, help="Max resolution for training")
+    parser.add_argument("--filter_type", type=str, default="image", choices=["image", "video"], help="Filter dataset for image or video samples")
 
     # Training Hyperparams
     parser.add_argument("--output_dir", type=str, default="output")
@@ -160,22 +163,11 @@ def main():
     parser.add_argument("--use_fsdp", action="store_true")
     parser.add_argument("--use_ema", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--trainable_modules", nargs='+', default=["attn", "norm"]) # Adjust based on strategy
-    parser.add_argument("--use_8bit_adam", action="store_true")
     parser.add_argument("--report_to", type=str, default="tensorboard")
-
-    # Loss Params
-    parser.add_argument("--weighting_scheme", type=str, default="logit_normal")
-    parser.add_argument("--logit_mean", type=float, default=0.0)
-    parser.add_argument("--logit_std", type=float, default=1.0)
-    parser.add_argument("--mode_scale", type=float, default=1.29)
-    parser.add_argument("--motion_sub_loss", action="store_true", help="Whether to use motion sub loss")
-    parser.add_argument("--motion_sub_loss_ratio", type=float, default=0.0, help="Ratio for motion sub loss")
     
     # Lora 
     parser.add_argument("--rank", type=int, default=128, help="The dimension of the LoRA update matrices")
     parser.add_argument("--network_alpha", type=float, default=64, help="The alpha parameter for LoRA scaling")
-    parser.add_argument("--lora_skip_name", type=str, default=None, help="List of module names to skip for LoRA")
     
     #evaluation
     parser.add_argument("--validation_paths", type=str, default=None, help="Path to validation dataset metadata")
@@ -300,9 +292,6 @@ def main():
 
     # --- D. Optimizer & Scheduler ---
     optimizer_cls = torch.optim.AdamW
-    if args.use_8bit_adam:
-        import bitsandbytes as bnb
-        optimizer_cls = bnb.optim.AdamW8bit
 
     trainable_params = list(filter(lambda p: p.requires_grad, transformer3d.parameters()))
     trainable_params_count = sum(p.numel() for p in trainable_params)
@@ -313,110 +302,86 @@ def main():
     
     noise_scheduler = FlowMatchEulerDiscreteScheduler(**filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs'])))
 
-    # --- E. Dataset & Dataloader (Crucial Change for VTON) ---
-    print(f"Initializing VTON Dataset...")
-    # 这里直接使用我们自定义的 Dataset，移除了 Bucket 逻辑
-    train_dataset = TryOnDataset(
-        ann_path=args.train_data_meta,
-        data_root=args.train_data_dir,
-        video_sample_size=args.video_sample_size, 
-        video_sample_stride=args.video_sample_stride,
-        video_sample_n_frames=args.video_sample_n_frames,
-        image_sample_size=args.video_sample_size,
-        video_repeat=args.video_repeat,
-        text_drop_ratio=0.0
-    )
 
-    def vton_collate_fn(examples):
-        # 1. 获取当前 Batch 的基准长宽比
-        # 因为 Sampler 已经分好桶了，我们取第一个样本的形状作为参考即可
-        ref_tensor = examples[0]["pixel_values"] # [C, T, H, W] or [C, H, W]
-        orig_h = ref_tensor.shape[-2]
-        orig_w = ref_tensor.shape[-1]
-        batch_aspect_ratio = orig_h / orig_w
+    def vton_collate_fn(examples, max_res=512):
+        """
+        功能：
+        1. 空间上：保持原长宽比，长边强制缩放到 max_res，并 32 对齐。
+        2. 时间上：以 Batch 中第一个样本的帧数为基准，强制对齐其他样本（复制或裁切）。
+        """
+        # ---------------------------------------------------
+        # 1. 计算目标分辨率 (Spatial)
+        # ---------------------------------------------------
+        raw_max_h = max([ex["pixel_values"].shape[-2] for ex in examples])
+        raw_max_w = max([ex["pixel_values"].shape[-1] for ex in examples])
 
-        # 2. 随机采样“训练分辨率基准” (Pixel Area Base)
-        # 论文策略：Stage 1 在 256-512 之间采样
-        base_size = random.choice(range(256, 512 + 1, 32)) 
-        
-        # 3. 计算目标 H, W
-        # 逻辑：保持 Aspect Ratio，让短边 = base_size (或者长边，取决于策略)
-        if batch_aspect_ratio > 1: # 竖屏 (Tall)
-            target_w = base_size
-            target_h = int(base_size * batch_aspect_ratio)
-        else: # 横屏 (Wide)
-            target_h = base_size
-            target_w = int(base_size / batch_aspect_ratio)
+        current_long_side = max(raw_max_h, raw_max_w)
 
-        # 4. 对齐到 16 (VAE 下采样倍率)
-        stride = 32
-        target_h = round(target_h / stride) * stride
-        target_w = round(target_w / stride) * stride
-        
-        # 兜底防止尺寸为0
-        target_h = max(stride, target_h)
-        target_w = max(stride, target_w)
+        # 强制缩放到 max_res
+        scale = max_res / current_long_side
 
-        # 5. 处理 Batch
-        # -----------------------------------------------
-        # 下面的逻辑与之前类似，但 interpolate 的 size 变成了动态的
-        
-        first_len = examples[0]["pixel_values"].shape[0]
-        is_video = first_len > 1
-        
-        if is_video:
-            max_len = max([ex["pixel_values"].shape[0] for ex in examples])
-            target_len = (max_len - 1) // 4 * 4 + 1
-            target_len = max(1, int(target_len))
-        else:
-            target_len = 1 
+        target_h = int(raw_max_h * scale)
+        target_w = int(raw_max_w * scale)
 
-        temporal_keys = ["pixel_values", "densepose_pixel_values", "agnostic_pixel_values", "mask_pixel_values"]
+        # VAE 32对齐
+        target_h = max(32, round(target_h / 32) * 32)
+        target_w = max(32, round(target_w / 32) * 32)
+
+        # ---------------------------------------------------
+        # 2. 确定目标帧数 (Temporal)
+        # ---------------------------------------------------
+        # 以第一个样本为基准。
+        # 如果是 Image Stage，这里是 1；如果是 Video Stage，这里是 49
+        target_len = examples[0]["pixel_values"].shape[0] 
+
+        # ---------------------------------------------------
+        # 3. 处理数据
+        # ---------------------------------------------------
         aligned_examples = []
-        
+        # 需要处理时间维度的 key
+        temporal_keys = ["pixel_values", "densepose_pixel_values", "agnostic_pixel_values", "mask_pixel_values"]
+
         for ex in examples:
             new_ex = {}
+            new_ex["data_type"] = ex["data_type"]
+            new_ex["text"] = ex["text"]
+            
+            # 获取当前样本的帧数
             curr_len = ex["pixel_values"].shape[0]
-            new_ex["data_type"] = "video" if is_video else "image"
 
             for key in temporal_keys:
-                tensor = ex[key] 
+                if key not in ex: continue
+                tensor = ex[key] # Shape: [T, C, H, W]
                 
-                # 时间对齐
+                # --- A. 时间维度对齐 (Temporal Align) ---
                 if curr_len < target_len:
+                    # 如果当前短 (e.g. 1 < 49)，重复填充
                     repeat_times = target_len // curr_len + 1
                     tensor = tensor.repeat(repeat_times, 1, 1, 1)[:target_len]
                 elif curr_len > target_len:
+                    # 如果当前长 (e.g. 60 > 49)，截取
                     tensor = tensor[:target_len]
                 
+                # --- B. 空间维度对齐 (Spatial Resize) ---
                 mode = 'nearest' if 'mask' in key or 'densepose' in key else 'bilinear'
-                align_corners = False if mode != 'nearest' else None 
+                align_corners = False if mode != 'nearest' else None
+                
+                # F.interpolate 接受 [N, C, H, W]，这里 T 维度充当 N，正好批量处理每一帧
+                if tensor.shape[-2] != target_h or tensor.shape[-1] != target_w:
+                    tensor = F.interpolate(tensor, size=(target_h, target_w), mode=mode, align_corners=align_corners)
+                
+                new_ex[key] = tensor
 
-                # [关键]：使用动态计算的 target_h, target_w
-                tensor_resized = F.interpolate(
-                    tensor, 
-                    size=(target_h, target_w), 
-                    mode=mode, 
-                    align_corners=align_corners,
-                    antialias=True if mode != 'nearest' else False
-                )
-                new_ex[key] = tensor_resized
+            # --- Cloth 单独处理 (始终是单帧图像，不需要时间对齐) ---
+            if "cloth_pixel_values" in ex:
+                cloth = ex["cloth_pixel_values"] # [1, C, H, W]
+                if cloth.shape[-2] != target_h or cloth.shape[-1] != target_w:
+                    cloth = F.interpolate(cloth, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                new_ex["cloth_pixel_values"] = cloth
 
-            # Cloth 处理 (Cloth 始终是单帧图片)
-            # Cloth 可以缩放到同样的 target_h/w，或者保持正方形 512x512
-            # 这里的策略取决于模型：Wan2.1 的 Clip/Image Encoder 是否要求 Cloth 必须是方形？
-            # 假设 Wan2.1 的 Image Encoder (SigLIP/DINO) 内部会自己处理 Resize (通常是Resize到224或384的正方形)
-            # 所以这里 Cloth 我们可以简单 Resize 到 target_h/target_w 方便处理，或者固定 512
-            # 为了保险起见，让 Cloth 和 Main Video 尺寸一致是比较通用的做法
-            new_ex["cloth_pixel_values"] = F.interpolate(
-                ex["cloth_pixel_values"], 
-                size=(target_h, target_w), 
-                mode='bilinear', align_corners=False, antialias=True
-            )
-            
-            new_ex["text"] = ex["text"]
             aligned_examples.append(new_ex)
 
+        # 4. Stack
         batch = {
             "pixel_values": torch.stack([ex["pixel_values"] for ex in aligned_examples]),
             "cloth_pixel_values": torch.stack([ex["cloth_pixel_values"] for ex in aligned_examples]),
@@ -426,14 +391,30 @@ def main():
             "text": [ex["text"] for ex in aligned_examples],
             "data_type": [ex["data_type"] for ex in aligned_examples]
         }
-        
+
         prompt_ids = tokenizer(
-            batch["text"], max_length=512, padding="max_length", truncation=True, return_tensors="pt"
+            batch["text"], 
+            max_length=512, 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt"
         )
         batch['input_ids'] = prompt_ids.input_ids
         batch['attention_mask'] = prompt_ids.attention_mask
-        
         return batch
+
+    # --- E. Dataset & Dataloader (Crucial Change for VTON) ---
+    print(f"Initializing VTON Dataset...")
+    # 这里直接使用我们自定义的 Dataset，移除了 Bucket 逻辑
+    train_dataset = TryOnDataset(
+        ann_path=args.train_data_meta,
+        data_root=args.train_data_dir,
+        video_sample_stride=args.video_sample_stride,
+        video_sample_n_frames=args.video_sample_n_frames,
+        video_repeat=args.video_repeat,
+        text_drop_ratio=0.0,
+        filter_type=args.filter_type
+    )
 
     base_sampler = RandomSampler(train_dataset)
     
@@ -446,10 +427,12 @@ def main():
         drop_last=False
     )
 
+    collate_fn_with_res = partial(vton_collate_fn, max_res=args.max_res)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
-        collate_fn=vton_collate_fn,
+        collate_fn=collate_fn_with_res,
         num_workers=args.dataloader_num_workers,
     )
 

@@ -2,7 +2,7 @@
     "bf16": {
         "enabled": true
     },
-    "train_micro_batch_size_per_gpu": 4,
+    "train_micro_batch_size_per_gpu": 16,
     "train_batch_size": "auto",
     "gradient_accumulation_steps": "auto",
     "dump_state": true,

@@ -385,53 +385,36 @@ class AspectRatioBatchImageVideoSamplerTryOn(BatchSampler):
         self.batch_size = batch_size
         self.aspect_ratios = aspect_ratios
         self.drop_last = drop_last
-        
-        # 定义两个桶：Image 和 Video
-        self.buckets = {
-            'image': {ratio: [] for ratio in aspect_ratios},
-            'video': {ratio: [] for ratio in aspect_ratios}
-        }
+        self.buckets = {ratio: [] for ratio in aspect_ratios}
 
     def __iter__(self):
         for idx in self.sampler:
             data_info = self.dataset_meta[idx]
             
-            # 1. 区分 Video / Image
-            # 根据你之前的 jsonl，type 是 'video' 或 'image'
-            dtype = data_info.get('type', 'image')
-            if dtype != 'video': dtype = 'image'
-
-            # 2. 直接读取宽高 (不再读文件)
             w = data_info.get('width')
             h = data_info.get('height')
 
-            if w is None or h is None:
-                ratio = 1.0 # 兜底
-            else:
-                ratio = float(h) / float(w)
+            if w is None or h is None: ratio = 1.0
+            else: ratio = float(h) / float(w)
 
-            # 3. 找最近的长宽比
+            # 找最近的长宽比
             closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
             
-            # 4. 入桶
-            bucket = self.buckets[dtype][closest_ratio]
+            # 入桶
+            bucket = self.buckets[closest_ratio]
             bucket.append(idx)
 
-            # 5. 产出 Batch
             if len(bucket) == self.batch_size:
                 yield bucket[:]
                 del bucket[:]
 
         if not self.drop_last:
-            for dtype in ['image', 'video']:
-                for ratio in self.buckets[dtype]:
-                    bucket = self.buckets[dtype][ratio]
-                    if len(bucket) > 0:
-                        yield bucket[:]
-                        del bucket[:]
+            for ratio in self.buckets:
+                bucket = self.buckets[ratio]
+                if len(bucket) > 0:
+                    yield bucket[:]
+                    del bucket[:]
 
     def __len__(self):
-        if self.drop_last:
-            return len(self.sampler) // self.batch_size
-        else:
-            return (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        # 简单估算
+        return len(self.sampler) // self.batch_size

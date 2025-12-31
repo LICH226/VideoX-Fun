@@ -10,7 +10,7 @@ export TRAIN_DATASET_META_NAME="/data/code/data/mydata/train_metadata.jsonl"
 export TEST_DATASET_META_NAME="/data/code/data/mydata/test_metadata.jsonl"
 
 # 定义输出目录变量，防止手写出错
-export OUTPUT_DIR="output_wan_2_2_49frames_12_30"
+export OUTPUT_DIR="output_wan_2_2_49frames_12_31"
 
 # 2. 预先创建输出目录 (防止 tee 报错)
 mkdir -p $OUTPUT_DIR
@@ -32,25 +32,23 @@ accelerate launch --config_file config/accelerate_config.yaml \
   --train_data_meta=$TRAIN_DATASET_META_NAME \
   --output_dir=$OUTPUT_DIR \
   --seed=42 \
-  --train_batch_size=4 \
-  --gradient_accumulation_steps=4 \
+  --train_batch_size=16 \
+  --gradient_accumulation_steps=2 \
   --dataloader_num_workers=4 \
   --num_train_epochs=1000 \
   --checkpointing_steps=500 \
   --max_train_steps=10000 \
-  --learning_rate=1e-5 \
+  --learning_rate=1e-4\
   --lr_scheduler="constant_with_warmup" \
   --lr_warmup_steps=200 \
   --gradient_checkpointing \
   --max_grad_norm=0.05 \
-  --video_sample_size=512 \
+  --max_res=512 \
+  --filter_type="image" \
   --video_sample_n_frames=49 \
   --video_sample_stride=1 \
   --rank=128 \
   --network_alpha=64 \
-  --lora_skip_name="ffn" \
-  --motion_sub_loss \
-  --motion_sub_loss_ratio=0.25 \
   --adam_weight_decay=3e-2 \
   --adam_epsilon=1e-10 \
   --validation_paths=$TEST_DATASET_META_NAME \
