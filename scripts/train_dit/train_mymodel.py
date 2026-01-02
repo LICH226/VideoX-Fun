@@ -14,46 +14,28 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
-import transformers
-import diffusers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel, compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
-from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.torch_utils import is_compiled_module
 from einops import rearrange
 from omegaconf import OmegaConf
-from packaging import version
-from PIL import Image
 from torch.utils.data import RandomSampler
-from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
-from transformers import SiglipVisionModel, SiglipImageProcessor, AutoModel, AutoImageProcessor
+from transformers import SiglipVisionModel, SiglipImageProcessor, AutoModel, AutoImageProcessor, AutoTokenizer
 
 from videox_fun.data.tryon_video import TryOnDataset 
 from videox_fun.data.bucket_sampler import AspectRatioBatchImageVideoSamplerTryOn, ASPECT_RATIO_512
 from videox_fun.models import AutoencoderKLWan3_8, CLIPModel, WanT5EncoderModel, WanTransformer3DModel
 from videox_fun.models.wan_transformer3d_tryon import WanTransformer3DTryonModel
-from videox_fun.pipeline import WanFunInpaintPipeline 
-from videox_fun.utils.discrete_sampler import DiscreteSampling
-from videox_fun.utils.utils import save_videos_grid
-from videox_fun.utils.lora_utils import create_network
 from peft import LoraConfig, get_peft_model, PeftModel
 from functools import partial
-
-
-if is_wandb_available():
-    import wandb
+from videox_fun.pipeline.pipeline_tryon_wan2_2 import WanTryOnPipeline
+from PIL import Image
+import wandb
 
 logger = get_logger(__name__, log_level="INFO")
-
-# -------------------------------------------------------------------------
-# 2. Utils
-# ------------------------------------------------------------------------
 
 def filter_kwargs(cls, kwargs):
     import inspect
@@ -67,53 +49,6 @@ def linear_decay(initial_value, final_value, total_steps, current_step):
     current_step = max(0, current_step)
     step_size = (final_value - initial_value) / total_steps
     return initial_value + step_size * current_step
-
-# -------------------------------------------------------------------------
-# 3. Validation Logic (Simplified for VTON)
-# -------------------------------------------------------------------------
-def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer3d, args, config, accelerator, weight_dtype, global_step):
-    try:
-        logger.info("Running validation... ")
-
-        # Load validation model copy
-        transformer3d_val = WanTransformer3DTryonModel.from_pretrained(
-            os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
-            transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
-        ).to(weight_dtype)
-        transformer3d_val.load_state_dict(accelerator.unwrap_model(transformer3d).state_dict())
-        
-        scheduler = FlowMatchEulerDiscreteScheduler(
-            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(config['scheduler_kwargs']))
-        )
-
-        # 强制使用 Inpaint Pipeline
-        pipeline = WanFunInpaintPipeline(
-            vae=accelerator.unwrap_model(vae).to(weight_dtype), 
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            tokenizer=tokenizer,
-            transformer=transformer3d_val,
-            scheduler=scheduler,
-            clip_image_encoder=clip_image_encoder,
-        )
-        pipeline = pipeline.to(accelerator.device)
-
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-
-        # 这里简化验证逻辑：VTON 通常需要成对的 (Model Image + Cloth Image)
-        # 如果 args.validation_prompts 只是文本，效果可能不好。
-        # 理想情况下，这里应该加载几个固定的 Validation Case (Input, Cloth, Mask)
-        # 暂时保留原逻辑，但在 VTON 中可能需要后续修改为读取特定文件夹的验证集
-        
-        # ... (Validation Loop Logic Placeholder) ... 
-        # 由于 VTON 需要特定的 input/mask 输入，单纯 text2video 的 validation 无法工作。
-        # 建议后续专门写一个 validation 脚本，或者在这里硬编码几个测试样本路径。
-        
-        del pipeline
-        del transformer3d_val
-        gc.collect()
-        torch.cuda.empty_cache()
-    except Exception as e:
-        print(f"Eval error: {e}")
 
 
 
@@ -130,7 +65,7 @@ def main():
     parser.add_argument("--image_encoder_2_path", type=str, default=None)
     
     # Data
-    parser.add_argument("--train_data_dir", type=str, required=True, help="Root of VIVID/VITON/DressCode")
+    parser.add_argument("--data_dir", type=str, required=True, help="Root of VIVID/VITON/DressCode")
     parser.add_argument("--train_data_meta", type=str, required=True, help="JSONL file path")
     parser.add_argument("--video_sample_size", type=int, default=512, help="Width (Height is usually 384 or adapted)")
     parser.add_argument("--video_sample_n_frames", type=int, default=49)
@@ -170,9 +105,10 @@ def main():
     parser.add_argument("--network_alpha", type=float, default=64, help="The alpha parameter for LoRA scaling")
     
     #evaluation
-    parser.add_argument("--validation_paths", type=str, default=None, help="Path to validation dataset metadata")
-    parser.add_argument("--validation_steps", type=int, default=500, help="Run validation every X steps")
-
+    parser.add_argument("--test_data_meta", type=str, default=None, help="Path to validation dataset metadata")
+    parser.add_argument("--test_steps", type=int, default=500, help="Run validation every X steps")
+    parser.add_argument("--test_height", type=int, default=1024, help="sample test height")
+    parser.add_argument("--test_width", type=int, default=768, help="sample test width")
     args = parser.parse_args()
     
     # --- B. Accelerator Setup ---
@@ -271,24 +207,17 @@ def main():
         modules_to_save=[
             "patch_embedding", 
             "subject_image_proj_model", 
-            "k_ip",    # 你的新模块
-            "v_ip",    # 你的新模块
+            "k_ip",   
+            "v_ip",    
             "norm_k_ip",
-            "adapter", # 如果有
+            "adapter", 
             "cloth_patch_embedding"
         ]
     )
 
     transformer3d = get_peft_model(transformer3d, lora_config)
     transformer3d.print_trainable_parameters()
-
     transformer3d.to(weight_dtype)
-
-    # EMA Setup
-    ema_transformer3d = None
-    if args.use_ema:
-        ema_transformer3d = EMAModel(transformer3d.parameters(), model_cls=WanTransformer3DModel, model_config=transformer3d.config)
-        ema_transformer3d.to(accelerator.device)
 
     # --- D. Optimizer & Scheduler ---
     optimizer_cls = torch.optim.AdamW
@@ -408,7 +337,7 @@ def main():
     # 这里直接使用我们自定义的 Dataset，移除了 Bucket 逻辑
     train_dataset = TryOnDataset(
         ann_path=args.train_data_meta,
-        data_root=args.train_data_dir,
+        data_root=args.data_dir,
         video_sample_stride=args.video_sample_stride,
         video_sample_n_frames=args.video_sample_n_frames,
         video_repeat=args.video_repeat,
@@ -436,8 +365,12 @@ def main():
         num_workers=args.dataloader_num_workers,
     )
 
-    transformer3d, optimizer, train_dataloader = accelerator.prepare(
-        transformer3d, optimizer, train_dataloader
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler , optimizer=optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps
+    )
+
+    transformer3d, optimizer, train_dataloader, lr_scheduler= accelerator.prepare(
+        transformer3d, optimizer, train_dataloader, lr_scheduler
     )
 
     if accelerator.is_main_process:
@@ -457,11 +390,10 @@ def main():
                 tracker_config[k] = str(v)
         # -------------------------------
         
-        accelerator.init_trackers("wan_vton_project", config=tracker_config)
+        accelerator.init_trackers("wan_vton_project", config=tracker_config,init_kwargs={"wandb": {"name": args.output_dir}})
 
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    # clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
     dino_image_encoder.to(accelerator.device, dtype=weight_dtype)
     siglip_image_encoder.to(accelerator.device, dtype=weight_dtype)
 
@@ -502,9 +434,6 @@ def main():
             except ValueError:
                 accelerator.print("Could not calculate global step, starting from 0")
 
-    lr_scheduler = get_scheduler(
-        "constant", optimizer=optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps
-    )
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.update(initial_global_step)
 
@@ -694,7 +623,51 @@ def main():
                         subject_image_embeds_dict=subject_image_embeds_dict,
                     )
 
-                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                pixel_mask = batch["mask_pixel_values"].to(device=latents.device, dtype=latents.dtype)
+
+                # 2. 将 Mask 调整为 Latent 尺寸
+                # model_pred 的形状通常是 [B, C, F, H_latent, W_latent]
+                # 我们只取 spatial 维度 (H_latent, W_latent) 进行插值
+                target_h, target_w = noise_pred.shape[-2], noise_pred.shape[-1]
+
+                # 使用 nearest 插值保持二值特性（要么是0要么是1，边缘更锐利）
+                # 如果 mask 是 5D [B, C, F, H, W]，interpolate 需要 reshape 或者只对最后两维操作
+                if pixel_mask.shape[-2:] != (target_h, target_w):
+                    # F.interpolate 对 5D 输入支持有限，通常建议压扁或者只处理 spatial
+                    # 简单做法：reshape 成 [B*F, 1, H, W] 处理完再变回来，或者直接用 trilinear (比较慢且边缘模糊)
+                    # 这里推荐最稳妥的 spatial resize 方式:
+                    b, c, f, h, w = pixel_mask.shape
+                    pixel_mask_reshaped = pixel_mask.transpose(1, 2).reshape(b * f, c, h, w) # [B*F, 1, H, W]
+                    
+                    latent_mask = torch.nn.functional.interpolate(
+                        pixel_mask_reshaped, 
+                        size=(target_h, target_w), 
+                        mode="nearest"  # 推荐 nearest 保持硬边界，bilinear 会产生 0.5 的灰边
+                    )
+                    
+                    # 变回 5D: [B, C, F, H, W]
+                    latent_mask = latent_mask.reshape(b, f, c, target_h, target_w).transpose(1, 2)
+                else:
+                    latent_mask = pixel_mask
+
+                # 3. 广播 Mask 以匹配 Latent 通道数
+                # Latent 通常有 16 个通道 (Wan2.1 VAE)，Mask 只有 1 个通道
+                # 形状变为 [B, 16, F, H, W] 以便相乘
+                # (其实 PyTorch 会自动广播，这步可以省略，但为了逻辑清晰可以写)
+                # latent_mask = latent_mask.expand_as(model_pred) 
+
+                # 4. 计算 Loss
+                # 先算差的平方 (Element-wise Squared Error)
+                diff = noise_pred - target
+                loss_map = diff ** 2
+
+                # 乘以 Mask (背景区域 Loss 变 0，Mask 区域 Loss 保留)
+                masked_loss_map = loss_map * latent_mask
+
+                # 5. 归一化 (Sum / Count)
+                # 注意：分母不能直接除以总像素，要除以 Mask 为 1 的像素数
+                # 加上 1e-6 防止除以 0 (虽然训练数据里应该都有 Mask)
+                loss = masked_loss_map.sum() / (latent_mask.sum() * noise_pred.shape[1] + 1e-6)
 
                 # 6. Backward
                 accelerator.backward(loss)
@@ -721,9 +694,155 @@ def main():
                 }
                 
                 accelerator.log(log_data, step=global_step)
-                
-                if step % 10 == 0: # 每10步打印一次，防止刷屏
-                    logger.info(f"Step {global_step}: Type={current_type.upper()}, Res={current_batch_res}, Frames={current_batch_frames}, Loss={loss.item():.4f}")
+
+                # if global_step % args.test_steps == 0:
+                #     if accelerator.is_main_process:
+                #         logger.info(f"🔍 Starting validation at step {global_step}...")
+                #         transformer3d.eval()
+                #         unwrapped_model = accelerator.unwrap_model(transformer3d)
+                #         validation_pipeline = WanTryOnPipeline(
+                #             tokenizer=tokenizer,
+                #             text_encoder=text_encoder,
+                #             vae=vae,
+                #             transformer=unwrapped_model,  # 直接传入训练中的 PeftModel
+                #             siglip_image_encoder=siglip_image_encoder,
+                #             siglip_image_processor=siglip_image_processor,
+                #             dino_image_encoder=dino_image_encoder,
+                #             dino_image_processor=dino_image_processor,
+                #             scheduler=noise_scheduler # 使用你训练用的 scheduler 即可
+                #         )
+                #         validation_pipeline.to(accelerator.device, weight_dtype)
+                #         test_dataset = TryOnDataset(
+                #             ann_path=args.test_data_meta,
+                #             data_root=args.data_dir,
+                #             video_sample_stride=args.video_sample_stride,
+                #             video_sample_n_frames=args.video_sample_n_frames,
+                #             video_repeat=args.video_repeat,
+                #             text_drop_ratio=0.0,
+                #             filter_type=args.filter_type
+                #         )
+                #         total_samples = len(test_dataset)
+                #         num_samples = 5
+                #         selected_indices = random.sample(range(total_samples), min(num_samples, total_samples))
+
+                #         wandb_log_images = []
+
+                #         try:
+                #             with torch.no_grad():
+                #                 for idx in selected_indices:
+                #                     sample = test_dataset[idx]
+                #                     base_name = f"step{global_step}_idx{idx}" # 给文件名加个前缀
+
+                #                     # --- 1. 辅助函数：将 Tensor 转为 PIL Image ---
+                #                     def tensor_2_pil(t, is_mask=False):
+                #                         if t.ndim == 5: t = t[0, :, 0, :, :] 
+                #                         elif t.ndim == 4: t = t[:, 0, :, :] 
+                #                         elif t.ndim == 3: t = t
+                                        
+                #                         t = t.float().cpu().permute(1, 2, 0).numpy()
+                                        
+                #                         # 如果是输入图像(agnostic/cloth)，通常是[-1, 1]归一化的，需要转回[0, 1]
+                #                         if not is_mask and t.min() < 0:
+                #                             t = (t / 2 + 0.5)
+                                        
+                #                         t = (t * 255).clip(0, 255).astype(np.uint8)
+                #                         if t.shape[2] == 1: t = t.squeeze(2)
+                #                         return Image.fromarray(t)
+
+                #                     # --- 2. 辅助函数：将 Output Numpy 转为 PIL Image ---
+                #                     def video_2_pil(v):
+                #                         if v.ndim == 5: v = v[0]
+                #                         if v.ndim == 4: v = v[:, 0, :, :]
+                #                         if v.shape[0] in [1, 3]: v = np.transpose(v, (1, 2, 0))
+                #                         if v.shape[-1] == 1: v = v.squeeze(-1)
+                #                         v = (v * 255).clip(0, 255).astype(np.uint8)
+                #                         return Image.fromarray(v)
+
+                #                     # --- 3. 准备 Tensor (和你原来的逻辑一样) ---
+                #                     def prepare_tensor(t, is_mask=False):
+                #                         t = t.to(accelerator.device, weight_dtype) # 修正：直接用 accelerator.device
+                #                         if t.ndim == 3: t = t.unsqueeze(0)
+                #                         if t.ndim == 4: t = t.unsqueeze(0)
+                #                         t = t.permute(0, 2, 1, 3, 4)
+                #                         # ... (你原来的 Resize 逻辑保留) ...
+                #                         if t.shape[-2] != args.test_height or t.shape[-1] != args.test_width:
+                #                              mode = 'nearest' if is_mask else 'bilinear'
+                #                              b, c, f, h, w = t.shape
+                #                              t_flattened = t.transpose(1, 2).reshape(b * f, c, h, w)
+                #                              t_resized = torch.nn.functional.interpolate(t_flattened, size=(args.test_height, args.test_width), mode=mode)
+                #                              t = t_resized.reshape(b, f, c, args.test_height, args.test_width).transpose(1, 2)
+                #                         return t
+
+                #                     pixel_t  = prepare_tensor(sample["pixel_values"])
+                #                     agnostic_t = prepare_tensor(sample["agnostic_pixel_values"])
+                #                     mask_t = prepare_tensor(sample["mask_pixel_values"], is_mask=True)
+                #                     densepose_t = prepare_tensor(sample["densepose_pixel_values"])
+                #                     cloth_t = prepare_tensor(sample["cloth_pixel_values"])
+                #                     prompt = sample["text"]
+
+                #                     # --- 4. 推理 ---
+                #                     output = validation_pipeline(
+                #                         prompt=prompt,
+                #                         image=agnostic_t,
+                #                         mask_image=mask_t,
+                #                         densepose_image=densepose_t,
+                #                         cloth_image=cloth_t,
+                #                         num_frames=1,
+                #                         height=args.test_height,
+                #                         width=args.test_width,
+                #                         num_inference_steps=20,
+                #                         guidance_scale=5.0,
+                #                         output_type="numpy"
+                #                     )
+
+                #                     # --- 5. 转换并保存到本地 ---
+                #                     pil_agnostic = tensor_2_pil(agnostic_t)
+                #                     pil_cloth = tensor_2_pil(cloth_t)
+                #                     pil_pose = tensor_2_pil(densepose_t)
+                #                     pil_pixel = tensor_2_pil(pixel_t)
+                #                     pil_result = video_2_pil(output.videos)
+
+                #                     # --- 6. 【关键】拼接图片用于 WandB 展示 ---
+                #                     # 顺序：模特原图(去掉了衣服) | 衣服图 | Densepose | 生成结果
+                #                     # 创建一张宽画布
+                #                     w, h = pil_result.size
+                #                     combo_image = Image.new('RGB', (w * 5, h))
+                #                     combo_image.paste(pil_agnostic, (0, 0))
+                #                     combo_image.paste(pil_cloth, (w, 0))
+                #                     combo_image.paste(pil_pose, (w * 2, 0))
+                #                     combo_image.paste(pil_result, (w * 3, 0))
+                #                     combo_image.paste(pil_pixel, (w*4, 0))
+
+                #                     # 添加到列表，准备上传
+                #                     # caption 可以写 prompt 或者 index
+                #                     wandb_log_images.append(
+                #                         wandb.Image(combo_image, caption=f"Step {global_step} | Idx {idx}")
+                #                     )
+
+                #                 logger.info("Validation inference completed.")
+                                
+                #                 # --- 7. 一次性上传到 WandB ---
+                #                 if len(wandb_log_images) > 0:
+                #                     # 检查 wandb tracker 是否存在
+                #                     tracker = accelerator.get_tracker("wandb")
+                #                     if tracker is not None:
+                #                         tracker.log(
+                #                             {"validation_samples": wandb_log_images}, 
+                #                             step=global_step
+                #                         )
+                #                     else:
+                #                         if wandb.run is not None:
+                #                             wandb.log({"validation_samples": wandb_log_images}, step=global_step)
+
+                #         except Exception as e:
+                #             logger.error(f"Validation failed: {e}")
+                #             import traceback
+                #             traceback.print_exc()
+
+                #         # 5. 清理现场 (这一步至关重要！)
+                #         del validation_pipeline
+                #         torch.cuda.empty_cache()
+                #         transformer3d.train()
 
                 # Checkpointing
                 if global_step % args.checkpointing_steps == 0:
